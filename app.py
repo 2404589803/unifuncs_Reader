@@ -5,10 +5,14 @@ from urllib.parse import quote
 import os
 from datetime import datetime
 import time
+import random
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import logging
 import sys
+import threading
+from urllib.error import URLError
+import socket
 
 # 配置日志
 def setup_logger():
@@ -35,15 +39,18 @@ logger = setup_logger()
 
 def create_session_with_retry():
     session = requests.Session()
-    # 设置重试策略
+    # 设置更强大的重试策略
     retries = Retry(
-        total=3,  # 最多重试3次
-        backoff_factor=1,  # 重试间隔时间
-        status_forcelist=[500, 502, 503, 504, -20001],  # 需要重试的状态码
+        total=5,  # 增加到5次重试
+        backoff_factor=2,  # 增加退避因子，使重试间隔更长
+        status_forcelist=[500, 502, 503, 504],  # 需要重试的状态码
+        allowed_methods=["GET", "POST"],  # 允许重试的方法
+        respect_retry_after_header=True  # 尊重服务器的Retry-After头
     )
     # 将重试策略应用到会话
-    session.mount('http://', HTTPAdapter(max_retries=retries))
-    session.mount('https://', HTTPAdapter(max_retries=retries))
+    adapter = HTTPAdapter(max_retries=retries, pool_maxsize=10, pool_connections=5)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
     return session
 
 def save_result(url, content, format_type):
@@ -79,9 +86,10 @@ def handle_error_response(response):
 - 错误代码：{error_code}
 - 错误信息：{error_message}
 - 请求ID：{request_id}
+- 状态码：{response.status_code}
 
 可能的解决方案：
-1. 如果是服务器错误(-20001)，请稍后重试
+1. 如果是服务器错误(-20001或502)，请稍后重试
 2. 检查API密钥是否正确
 3. 确认URL是否可访问
 4. 检查网络连接是否正常
@@ -93,6 +101,36 @@ def handle_error_response(response):
         error_msg = f"请求失败: HTTP {response.status_code}\n{response.text}"
         logger.error(error_msg)
         return error_msg
+
+def make_request_with_backoff(session, method, url, **kwargs):
+    """带指数退避的请求函数"""
+    max_retries = 5
+    base_delay = 2  # 基础延迟（秒）
+    
+    for attempt in range(max_retries):
+        try:
+            if method.upper() == 'GET':
+                response = session.get(url, **kwargs)
+            else:
+                response = session.post(url, **kwargs)
+                
+            # 检查是否需要重试的状态码
+            if response.status_code in [500, 502, 503, 504]:
+                raise requests.exceptions.RequestException(f"服务器返回错误状态码: {response.status_code}")
+                
+            return response
+            
+        except (requests.exceptions.RequestException, URLError, socket.error) as e:
+            logger.warning(f"请求失败（尝试 {attempt+1}/{max_retries}）: {str(e)}")
+            
+            if attempt == max_retries - 1:
+                # 最后一次尝试，重新抛出异常
+                raise
+                
+            # 计算退避时间（带随机因子）
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+            logger.info(f"等待 {delay:.2f} 秒后重试...")
+            time.sleep(delay)
 
 def web_reader(url, api_key, request_type, format_type="markdown", 
                include_images=True, include_videos=False, include_position=False,
@@ -125,21 +163,34 @@ def web_reader(url, api_key, request_type, format_type="markdown",
             params = {
                 "apiKey": api_key,
                 "format": format_type,
-                "includeImages": include_images,
-                "includeVideos": include_videos,
-                "includePosition": include_position,
+                "includeImages": str(include_images).lower(),  # 转换为字符串
+                "includeVideos": str(include_videos).lower(),
+                "includePosition": str(include_position).lower(),
                 "onlyCSSSelectors": ','.join(only_css) if only_css else None,
                 "waitForCSSSelectors": ','.join(wait_css) if wait_css else None,
                 "excludeCSSSelectors": ','.join(exclude_css) if exclude_css else None,
-                "linkSummary": link_summary
+                "linkSummary": str(link_summary).lower()
             }
             logger.info("发送GET请求...")
             progress(0.4, desc="发送GET请求...")
-            response = session.get(base_url, params=params, timeout=30)
+            try:
+                # 使用自定义退避重试函数
+                response = make_request_with_backoff(
+                    session, 
+                    'GET', 
+                    base_url, 
+                    params=params, 
+                    timeout=60,  # 增加超时时间
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                )
+            except Exception as e:
+                logger.error(f"GET请求失败: {str(e)}")
+                raise
         else:  # POST请求
             headers = {
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}"
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
             data = {
                 "url": url,
@@ -154,26 +205,36 @@ def web_reader(url, api_key, request_type, format_type="markdown",
             }
             logger.info("发送POST请求...")
             progress(0.4, desc="发送POST请求...")
-            response = session.post(
-                "https://api.unifuncs.com/api/web-reader/read",
-                headers=headers,
-                json=data,
-                timeout=30
-            )
+            try:
+                # 使用自定义退避重试函数
+                response = make_request_with_backoff(
+                    session, 
+                    'POST', 
+                    "https://api.unifuncs.com/api/web-reader/read",
+                    headers=headers,
+                    json=data,
+                    timeout=60  # 增加超时时间
+                )
+            except Exception as e:
+                logger.error(f"POST请求失败: {str(e)}")
+                raise
 
         logger.info(f"收到响应: HTTP {response.status_code}")
         progress(0.6, desc="处理响应...")
-        if response.status_code == 200:
-            try:
-                # 尝试解析JSON响应
-                result = response.json()
-                if isinstance(result, dict) and result.get('code') == -20001:
-                    progress(1.0, desc="服务器错误")
-                    return handle_error_response(response)
-            except json.JSONDecodeError:
-                # 如果不是JSON格式，按正常内容处理
-                pass
-                
+        
+        # 检查是否为JSON错误响应
+        is_error_json = False
+        try:
+            result = response.json()
+            if isinstance(result, dict) and result.get('code') and result.get('code') < 0:
+                is_error_json = True
+                progress(1.0, desc="处理错误响应...")
+                return handle_error_response(response)
+        except json.JSONDecodeError:
+            # 不是JSON格式，继续处理
+            pass
+            
+        if response.status_code == 200 and not is_error_json:
             content = response.text
             progress(0.8, desc="保存结果...")
             
@@ -197,6 +258,13 @@ def web_reader(url, api_key, request_type, format_type="markdown",
         logger.error(error_msg)
         progress(1.0, desc="连接错误")
         return error_msg
+    except requests.exceptions.RequestException as e:
+        error_msg = f"请求异常: {str(e)}"
+        logger.error(error_msg)
+        progress(1.0, desc="请求异常")
+        if "502" in str(e):
+            return "服务器暂时不可用(502错误)，这通常是临时性问题。请稍后再试或尝试不同的URL。"
+        return error_msg
     except Exception as e:
         error_msg = f"发生错误: {str(e)}"
         logger.error(error_msg, exc_info=True)  # 打印完整的错误堆栈
@@ -211,9 +279,13 @@ with gr.Blocks(title="网页内容提取工具", theme=gr.themes.Soft()) as demo
     结果将自动保存在 saved_results 目录下。
     
     注意事项：
-    1. 如果遇到服务器错误，系统会自动重试
-    2. 每个请求默认超时时间为30秒
-    3. 如果持续失败，请检查API密钥和网络连接
+    1. 如果遇到服务器错误(如502)，系统会自动重试
+    2. 每个请求默认超时时间为60秒
+    3. 如果持续失败，请尝试以下方法:
+       - 稍后再试
+       - 使用不同的URL
+       - 检查API密钥是否正确
+       - 检查网络连接
     4. 详细的错误信息会打印在终端中
     """)
     
@@ -265,4 +337,5 @@ with gr.Blocks(title="网页内容提取工具", theme=gr.themes.Soft()) as demo
 
 if __name__ == "__main__":
     logger.info("启动网页内容提取工具...")
-    demo.launch(share=True) 
+    # 禁用共享链接，避免frpc相关问题
+    demo.launch(share=False) 
